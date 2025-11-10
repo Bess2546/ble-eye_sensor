@@ -19,7 +19,7 @@ NimBLEScan* pBLEScan;
 // --------- ค่าเซนเซอร์ที่จะแสดงบนจอ ----------
 struct SensorData {
   bool hasEddystone = false;
-  bool decoded      = false;
+  bool decoded = false;
   int batt_mV = -1;    // จาก TLM
   float temp_C = NAN;  // จาก TLM
   int advCount = -1;   // จาก TLM
@@ -31,6 +31,15 @@ struct SensorData {
 } g;
 
 uint32_t g_lastSensorMs = 0;
+
+struct TeltoScale {
+  enum TempMode { Q8_4_DIV16,
+                  DIV100,
+                  TLM_DIV256 } tempMode = Q8_4_DIV16;
+  enum BattMode { STEP_X40mV,
+                  BASE2000_PLUS_10mV } battMode = STEP_X40mV;
+};
+
 // ------------------------------------------------
 
 static void printHex(const uint8_t* p, size_t n) {
@@ -63,83 +72,140 @@ static void tryParseTLVGeneric(const uint8_t* p, size_t n) {
   }
 }
 
-// ✅ Teltonika MFID=0x089A Decode (เพิ่มตรงนี้)
+
+
+static float decodeTemp_val(int16_t raw, const TeltoScale& sc) {
+  switch (sc.tempMode) {
+    case TeltoScale::Q8_4_DIV16: return raw / 16.0f;
+    case TeltoScale::DIV100: return raw / 100.0f;
+    case TeltoScale::TLM_DIV256: return raw / 256.0f;
+  }
+  return NAN;
+}
+
+static int decodeBatt_mV(uint8_t step, const TeltoScale& sc) {
+  switch (sc.battMode) {
+    case TeltoScale::STEP_X40mV: return (int)step * 40;                 // 0.04V/step
+    case TeltoScale::BASE2000_PLUS_10mV: return 2000 + (int)step * 10;  // 2.0V + 10mV/step
+  }
+  return -1;
+}
+
+
+// Teltonika MFID=0x089A Decode
 static void parseTeltonika089A(const uint8_t* p, size_t n) {
-  // โครงสร้าง: [ver(1)][flags(1)][extended...]
+  // Expect: [ver(1)][flags(1)][values...]
   if (n < 2) return;
 
-  uint8_t ver   = p[0];
+  uint8_t ver = p[0];
   uint8_t flags = p[1];
   const uint8_t* v = p + 2;
-  size_t   r = n - 2;
+  size_t r = n - 2;
 
   Serial.printf(" TELTO ver=0x%02X flags=0x%02X\n", ver, flags);
+  auto has = [&](int bit) {
+    return (flags >> bit) & 0x01;
+  };
 
-  // ตามสเปก: เรียงข้อมูลตามลิสต์นี้เมื่อ flag ถูกตั้ง
-  auto need = [&](int bit){ return (flags >> bit) & 0x01; };
-
-  // ตัวแปรชั่วคราว
-  bool got = false;
-  int   batt_mV = -1;
+  // ค่าออก
   float tempC = NAN;
-  int   hum = -1;
+  int hum = -1;
+  uint8_t moveState = 0;
   uint16_t moveCnt = 0;
-  int8_t  pitch = 0;
-  int16_t roll  = 0;
-  bool magnet_present = need(2);
-  bool magnet_state   = need(3); // 1=มีแม่เหล็ก, 0=ไม่มีแม่เหล็ก (ตามสเปก)
+  uint32_t angleRaw24 = 0;
+  int batt_mV = -1;
 
-  // 0: Temperature (2B, °C/100)
-  if (need(0)) {
+  // เริ่มด้วยสเกลมาตรฐาน แล้ว fallback อัตโนมัติถ้าดูเพี้ยน
+  TeltoScale sc;
+  sc.tempMode = TeltoScale::Q8_4_DIV16;
+  sc.battMode = TeltoScale::STEP_X40mV;
+
+  // bit0: Temperature (2B, signed)
+  if (has(0)) {
     if (r < 2) return;
-    int16_t t = (int16_t)((v[0] << 8) | v[1]);
-    tempC = t / 100.0f;
-    v += 2; r -= 2;
+    int16_t raw = (int16_t)((v[0] << 8) | v[1]);
+    v += 2;
+    r -= 2;
+    tempC = decodeTemp_val(raw, sc);
+
+    // auto-fallback ถ้าอุณหภูมิหลุดโลก (<-40 หรือ >85 โดยทั่วไป)
+    if (tempC < -40.0f || tempC > 85.0f) {
+      float t2 = (float)raw / 100.0f;  // DIV100
+      if (t2 >= -40.0f && t2 <= 85.0f) {
+        sc.tempMode = TeltoScale::DIV100;
+        tempC = t2;
+      } else {
+        float t3 = (float)raw / 256.0f;  // TLM
+        if (t3 >= -40.0f && t3 <= 85.0f) {
+          sc.tempMode = TeltoScale::TLM_DIV256;
+          tempC = t3;
+        }
+      }
+    }
   }
 
-  // 1: Humidity (1B, %)
-  if (need(1)) {
+  // bit1: Humidity (1B, %)
+  if (has(1)) {
     if (r < 1) return;
     hum = v[0];
-    v += 1; r -= 1;
+    v += 1;
+    r -= 1;
   }
 
-  // 4: Movement counter (2B), MSB = movement state อยู่ในเอกสารเป็นอีกบิตหนึ่ง (bit4 เป็น presence)
-  if (need(4)) {
+  // bit2: Magnetic presence (ไม่มี payload)
+  // bit3: Magnetic state (ไม่มี payload)
+  bool magPresent = has(2);
+  bool magState = has(3);
+
+  // bit4: Movement state+counter (2B) [state: upper 4 bits, counter: lower 12 bits]
+  if (has(4)) {
     if (r < 2) return;
-    moveCnt = (uint16_t)((v[0] << 8) | v[1]);
-    v += 2; r -= 2;
+    uint16_t m = (uint16_t)((v[0] << 8) | v[1]);
+    v += 2;
+    r -= 2;
+    moveState = (m >> 12) & 0x0F;
+    moveCnt = m & 0x0FFF;
   }
 
-  // 5: Movement angle (3B): pitch(int8), roll(int16)
-  if (need(5)) {
+  // bit5: Movement angle (3B raw, 24-bit)
+  if (has(5)) {
     if (r < 3) return;
-    pitch = (int8_t)v[0];
-    roll  = (int16_t)((v[1] << 8) | v[2]);
-    v += 3; r -= 3;
+    angleRaw24 = ((uint32_t)v[0] << 16) | ((uint32_t)v[1] << 8) | v[2];
+    v += 3;
+    r -= 3;
   }
 
-  // 7: Battery (1B): mV = 2000 + N*10
-  if (need(7)) {
+  // bit6: Low battery flag only (ไม่มี payload) → ใช้ร่วมกับแบตจริง
+  bool lowBattFlag = has(6);
+
+  // bit7: Battery (1B)
+  if (has(7)) {
     if (r < 1) return;
-    batt_mV = 2000 + ((int)v[0]) * 10;
-    v += 1; r -= 1;
+    uint8_t step = v[0];
+    v += 1;
+    r -= 1;
+    batt_mV = decodeBatt_mV(step, sc);
+
+    // fallback ถ้าผลลัพธ์ดูไม่สมเหตุผล (<2000 หรือ >5000)
+    if (batt_mV < 2000 || batt_mV > 5000) {
+      sc.battMode = TeltoScale::BASE2000_PLUS_10mV;
+      batt_mV = decodeBatt_mV(step, sc);
+    }
   }
 
-  // อัปเดตค่าแสดงผล (เฉพาะเมื่อ decode สำเร็จจริง)
-  g.batt_mV      = batt_mV;
-  g.temp_C       = tempC;
+  // อัปเดต global (อย่าใช้ช่องอื่นทดไว้สับสน)
+  g.temp_C = tempC;
   g.humidity_pct = hum;
-  g.advCount     = moveCnt;          // ใช้เก็บ movement count ชั่วคราว (หรือเพิ่มฟิลด์ใหม่ก็ได้)
-  g.uptime_s     = (pitch << 16) | (uint16_t)roll; // ถ้ายังไม่ใช้ uptime, เก็บ angle ไว้ชั่วคราว (หรือเพิ่มฟิลด์ใหม่)
-  g.name         = "MP1_D3BB42";     // ตอกย้ำชื่อเป้าหมาย
+  g.advCount = (int)moveCnt;     // มีฟิลด์ count อยู่แล้ว
+  g.uptime_s = (int)angleRaw24;  // เก็บ angleRaw ไว้ชั่วคราว (ถ้าจะโชว์)
+  g.batt_mV = batt_mV;
+  g.decoded = true;
   g_lastSensorMs = millis();
-  g.decoded      = true;
-  got = true;
 
-  Serial.printf(" DECODED -> Batt=%d mV Temp=%.2f C Hum=%d%% MoveCnt=%u Pitch=%d Roll=%d Magnet=%s\n",
-                g.batt_mV, g.temp_C, g.humidity_pct, moveCnt, pitch, roll,
-                (magnet_present ? (magnet_state ? "DETECTED" : "NOT DETECTED") : "N/A"));
+  Serial.printf(" DECODED -> T=%.2fC H=%d%% Move[state=%u,cnt=%u] AngleRaw=0x%06X Batt=%dmV LowBatt=%s Mag=%s\n",
+                g.temp_C, g.humidity_pct, moveState, moveCnt, (unsigned)angleRaw24,
+                g.batt_mV, lowBattFlag ? "YES" : "NO",
+                magPresent ? (magState ? "DETECTED" : "NOT DETECTED") : "N/A");
 }
 
 
@@ -208,12 +274,8 @@ class ScanCallbacks : public NimBLEScanCallbacks {
             // (ถ้ามี header 2 ไบต์ของ frameType/flags ตามโค้ดเดิม)
             if (plen >= 2) {
               Serial.printf(" frameType=0x%02X flags/mask=0x%02X\n", payload[0], payload[1]);
+              parseTeltonika089A(payload, plen);
             }
-
-            // เรียก TLV parser ของเรา (จะตั้ง g.decoded และ g_lastSensorMs เมื่อถอดสำเร็จ)
-            const uint8_t* tlv = (plen > 2) ? (payload + 2) : payload;
-            size_t tln = (plen > 2) ? (plen - 2) : plen;
-            parseTeltonika089A(tlv, tln);
           }
         }
         // 3) Vendor อื่น ๆ
